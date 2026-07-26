@@ -12,13 +12,11 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.popup import Popup
-from kivy.uix.image import Image as KivyImage
 from kivy.core.clipboard import Clipboard
 from kivy.network.urlrequest import UrlRequest
 from kivy.clock import mainthread
 from kivy.metrics import dp
 
-# FIX: keyboard khulne par screen black/blank hone ka bug
 Window.softinput_mode = "below_target"
 
 CONFIG_FILE = "settings.json"
@@ -83,15 +81,43 @@ def read_pdf_text(filepath):
 
 
 def create_pdf_from_text(text, filename="output.pdf"):
-    from fpdf import FPDF
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", size=12)
-    for line in text.split("\n"):
-        safe_line = line.encode("latin-1", "replace").decode("latin-1")
-        pdf.multi_cell(0, 8, safe_line)
+    """reportlab se PDF banata hai — fpdf2/fontTools ka dependency issue avoid karne ke liye."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+
     out_path = get_path(filename)
-    pdf.output(out_path)
+    c = canvas.Canvas(out_path, pagesize=A4)
+    width, height = A4
+    x_margin = 15 * mm
+    y = height - 20 * mm
+    line_height = 6 * mm
+    c.setFont("Helvetica", 10)
+
+    for raw_line in text.split("\n"):
+        # simple word-wrap so long lines don't overflow the page
+        words = raw_line.split(" ")
+        line = ""
+        for word in words:
+            test_line = (line + " " + word).strip()
+            if c.stringWidth(test_line, "Helvetica", 10) > (width - 2 * x_margin):
+                c.drawString(x_margin, y, line)
+                y -= line_height
+                line = word
+                if y < 20 * mm:
+                    c.showPage()
+                    c.setFont("Helvetica", 10)
+                    y = height - 20 * mm
+            else:
+                line = test_line
+        c.drawString(x_margin, y, line)
+        y -= line_height
+        if y < 20 * mm:
+            c.showPage()
+            c.setFont("Helvetica", 10)
+            y = height - 20 * mm
+
+    c.save()
     return out_path
 
 
@@ -103,6 +129,24 @@ def is_pdf_command(text):
 def image_to_base64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
+
+def resolve_shared_path(uri_or_path):
+    """
+    Gallery se aayi content:// URI ko app ke private storage me copy karke
+    real usable file-path deta hai (Android scoped-storage ke liye zaroori).
+    """
+    if not uri_or_path:
+        return None
+    if not str(uri_or_path).startswith("content://"):
+        return uri_or_path
+    try:
+        from androidstorage4kivy import SharedStorage
+        ss = SharedStorage()
+        local_path = ss.copy_from_shared(uri_or_path)
+        return local_path
+    except Exception:
+        return None
 
 
 # ---------- UI ----------
@@ -170,24 +214,18 @@ class ChatScreen(Screen):
         self.scroll.add_widget(self.chat_box)
         root.add_widget(self.scroll)
 
-        # Attachment preview strip (image chuni ho to yaha dikhega)
         self.attach_label = Label(text="", size_hint_y=None, height=0, color=(0.7, 0.9, 1, 1))
         root.add_widget(self.attach_label)
 
-        # Row 1: attachment buttons
         attach_bar = BoxLayout(size_hint_y=None, height=dp(48), padding=dp(4), spacing=dp(4))
         file_btn = Button(text="File")
         file_btn.bind(on_release=self.open_file_chooser)
         gallery_btn = Button(text="Gallery")
         gallery_btn.bind(on_release=self.open_gallery)
-        camera_btn = Button(text="Camera")
-        camera_btn.bind(on_release=self.open_camera)
         attach_bar.add_widget(file_btn)
         attach_bar.add_widget(gallery_btn)
-        attach_bar.add_widget(camera_btn)
         root.add_widget(attach_bar)
 
-        # Row 2: text input + send
         input_bar = BoxLayout(size_hint_y=None, height=dp(56), padding=dp(4), spacing=dp(4))
         self.input = TextInput(
             hint_text="App/website/game ka code maango...",
@@ -230,7 +268,7 @@ class ChatScreen(Screen):
         save_history(self.messages)
         self.chat_box.clear_widgets()
 
-    # ---------- Attachments: File / Gallery / Camera ----------
+    # ---------- Attachments ----------
 
     def open_file_chooser(self, *a):
         chooser = FileChooserListView(path="/storage/emulated/0/", filters=["*.pdf", "*.txt"])
@@ -254,28 +292,22 @@ class ChatScreen(Screen):
         except Exception as e:
             self.add_bubble(f"⚠ Gallery open nahi hui: {e}", is_user=False)
 
+    @mainthread
     def on_gallery_selected(self, selection):
-        if selection:
-            self.attach_image(selection[0])
-
-    def open_camera(self, *a):
-        try:
-            from plyer import camera
-            path = get_path("camera_capture.jpg")
-            camera.take_picture(filename=path, on_complete=self.on_camera_captured)
-        except Exception as e:
-            self.add_bubble(f"⚠ Camera open nahi hui: {e}", is_user=False)
-
-    def on_camera_captured(self, filepath):
-        if filepath and os.path.exists(filepath):
-            self.attach_image(filepath)
+        if not selection:
+            return
+        raw_uri = selection[0]
+        real_path = resolve_shared_path(raw_uri)
+        if not real_path or not os.path.exists(real_path):
+            self.add_bubble("⚠ Image select hui lekin access nahi ho payi. Dobara try karo.",
+                             is_user=False)
+            return
+        self.attach_image(real_path)
 
     def attach_image(self, path):
         self.pending_image_path = path
         self.attach_label.text = f"📷 Attached: {os.path.basename(path)} (Send dabao)"
         self.attach_label.height = dp(28)
-
-    # ---------- File upload (pdf/txt) ----------
 
     def handle_uploaded_file(self, filepath):
         self.add_bubble(f"[File uploaded: {os.path.basename(filepath)}]", is_user=True)
