@@ -1,6 +1,5 @@
 import json
 import os
-import threading
 from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.uix.boxlayout import BoxLayout
@@ -18,6 +17,12 @@ from kivy.metrics import dp
 
 CONFIG_FILE = "settings.json"
 HISTORY_FILE = "history.json"
+
+PDF_COMMAND_WORDS = [
+    "pdf creat", "pdf create", "pdf banao", "pdf bana", "pdf bnao",
+    "save as pdf", "pdf me save", "pdf me convert", "pdf convert",
+    "iska pdf", "isko pdf", "is code ka pdf",
+]
 
 
 # ---------- Storage helpers ----------
@@ -60,7 +65,6 @@ def save_history(messages):
 
 
 def read_pdf_text(filepath):
-    """Extract text from an uploaded PDF."""
     try:
         from pypdf import PdfReader
         reader = PdfReader(filepath)
@@ -73,7 +77,6 @@ def read_pdf_text(filepath):
 
 
 def create_pdf_from_text(text, filename="output.pdf"):
-    """Create a real downloadable PDF file from text content."""
     from fpdf import FPDF
     pdf = FPDF()
     pdf.add_page()
@@ -84,6 +87,11 @@ def create_pdf_from_text(text, filename="output.pdf"):
     out_path = get_path(filename)
     pdf.output(out_path)
     return out_path
+
+
+def is_pdf_command(text):
+    lowered = text.lower()
+    return any(word in lowered for word in PDF_COMMAND_WORDS)
 
 
 # ---------- UI ----------
@@ -120,8 +128,7 @@ class ChatBubble(BoxLayout):
                            size_hint=(0.85, 0.3))
             popup.open()
         except Exception as e:
-            popup = Popup(title="Error",
-                           content=Label(text=str(e)),
+            popup = Popup(title="Error", content=Label(text=str(e)),
                            size_hint=(0.85, 0.3))
             popup.open()
 
@@ -130,6 +137,7 @@ class ChatScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.messages = load_history()
+        self.last_ai_text = ""
 
         root = BoxLayout(orientation="vertical")
 
@@ -154,13 +162,13 @@ class ChatScreen(Screen):
         self.input = TextInput(
             hint_text="App/website/game ka code maango...",
             multiline=False,
-            foreground_color=(1, 1, 1, 1),      # FIX: text ab dikhega
+            foreground_color=(1, 1, 1, 1),
             background_color=(0.15, 0.15, 0.15, 1),
             hint_text_color=(0.6, 0.6, 0.6, 1),
             cursor_color=(1, 1, 1, 1),
         )
         self.input.bind(on_text_validate=self.send_message)
-        upload_btn = Button(text="📎", size_hint_x=None, width=dp(50))
+        upload_btn = Button(text="Upload", size_hint_x=None, width=dp(80))
         upload_btn.bind(on_release=self.open_file_chooser)
         send_btn = Button(text="Send", size_hint_x=None, width=dp(80))
         send_btn.bind(on_release=self.send_message)
@@ -171,14 +179,10 @@ class ChatScreen(Screen):
 
         self.add_widget(root)
 
-        # restore old history on screen
         for m in self.messages:
             self.render_bubble(m["text"], m["is_user"])
-
-    def on_pre_enter(self, *a):
-        if not self.chat_box.children:
-            for m in self.messages:
-                self.render_bubble(m["text"], m["is_user"])
+            if not m["is_user"]:
+                self.last_ai_text = m["text"]
 
     def render_bubble(self, text, is_user):
         bubble = ChatBubble(text=text, is_user=is_user, width=self.chat_box.width)
@@ -190,9 +194,12 @@ class ChatScreen(Screen):
         if persist:
             self.messages.append({"text": text, "is_user": is_user})
             save_history(self.messages)
+        if persist and not is_user:
+            self.last_ai_text = text
 
     def clear_history(self, *a):
         self.messages = []
+        self.last_ai_text = ""
         save_history(self.messages)
         self.chat_box.clear_widgets()
 
@@ -236,6 +243,21 @@ class ChatScreen(Screen):
             return
         self.input.text = ""
         self.add_bubble(text, is_user=True)
+
+        # NEW: agar user "pdf banao/creat karo" jaisa command de,
+        # to AI ko call na karke seedha last AI response ka real PDF bana do
+        if is_pdf_command(text):
+            if self.last_ai_text:
+                try:
+                    path = create_pdf_from_text(self.last_ai_text)
+                    self.add_bubble(f"✅ PDF ban gayi:\n{path}", is_user=False)
+                except Exception as e:
+                    self.add_bubble(f"⚠ PDF banane me error: {e}", is_user=False)
+            else:
+                self.add_bubble("⚠ Pehle koi code/text maango, uske baad 'pdf banao' bolo.",
+                                 is_user=False)
+            return
+
         settings = load_settings()
         if not settings.get("api_key"):
             self.add_bubble("⚠ Pehle Settings me API key daalo.", is_user=False)
@@ -251,9 +273,7 @@ class ChatScreen(Screen):
             "Tum ek coding assistant ho. User jis app/website/game ka code maange, "
             "uska pura, clean, copy-paste-ready code do. Agar user format bataye "
             "(HTML, Python, Kivy, JS, etc.) to usi format me do. Agar user 'update' "
-            "ya 'fix' bole to sirf modified code do, saath me chhota explanation. "
-            "Agar user 'PDF format' maange, to inhe bolo ki 'Save as PDF' button "
-            "dabakar wo apne code ko turant real PDF file me convert kar sakte hain."
+            "ya 'fix' bole to sirf modified code do, saath me chhota explanation."
         )
 
         if provider == "Groq":
@@ -267,7 +287,7 @@ class ChatScreen(Screen):
                     {"role": "user", "content": prompt},
                 ],
             })
-        else:  # Gemini
+        else:
             model_name = model or "gemini-2.0-flash"
             url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                    f"{model_name}:generateContent?key={api_key}")
@@ -288,7 +308,6 @@ class ChatScreen(Screen):
 
     @mainthread
     def on_ai_success(self, result, provider):
-        # remove the "...soch raha hu..." placeholder bubble
         if self.chat_box.children:
             self.chat_box.remove_widget(self.chat_box.children[0])
         try:
