@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.uix.boxlayout import BoxLayout
@@ -8,21 +9,26 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
+from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.popup import Popup
 from kivy.core.clipboard import Clipboard
 from kivy.network.urlrequest import UrlRequest
 from kivy.clock import mainthread
 from kivy.metrics import dp
 
 CONFIG_FILE = "settings.json"
+HISTORY_FILE = "history.json"
 
 
-def get_config_path():
+# ---------- Storage helpers ----------
+
+def get_path(name):
     app = App.get_running_app()
-    return os.path.join(app.user_data_dir, CONFIG_FILE)
+    return os.path.join(app.user_data_dir, name)
 
 
 def load_settings():
-    path = get_config_path()
+    path = get_path(CONFIG_FILE)
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
@@ -33,9 +39,54 @@ def load_settings():
 
 
 def save_settings(data):
-    with open(get_config_path(), "w") as f:
+    with open(get_path(CONFIG_FILE), "w") as f:
         json.dump(data, f)
 
+
+def load_history():
+    path = get_path(HISTORY_FILE)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def save_history(messages):
+    with open(get_path(HISTORY_FILE), "w") as f:
+        json.dump(messages, f)
+
+
+def read_pdf_text(filepath):
+    """Extract text from an uploaded PDF."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(filepath)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text.strip() or "(PDF me text nahi mila — shayad scanned image hai)"
+    except Exception as e:
+        return f"(PDF read error: {e})"
+
+
+def create_pdf_from_text(text, filename="output.pdf"):
+    """Create a real downloadable PDF file from text content."""
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    for line in text.split("\n"):
+        safe_line = line.encode("latin-1", "replace").decode("latin-1")
+        pdf.multi_cell(0, 8, safe_line)
+    out_path = get_path(filename)
+    pdf.output(out_path)
+    return out_path
+
+
+# ---------- UI ----------
 
 class ChatBubble(BoxLayout):
     def __init__(self, text, is_user=False, **kwargs):
@@ -43,24 +94,50 @@ class ChatBubble(BoxLayout):
                           padding=dp(8), spacing=dp(4), **kwargs)
         self.bind(minimum_height=self.setter("height"))
 
-        label = Label(text=text, size_hint_y=None, halign="left", valign="top")
+        prefix = "You: " if is_user else ""
+        label = Label(text=prefix + text, size_hint_y=None, halign="left",
+                       valign="top", color=(1, 1, 1, 1))
         label.bind(texture_size=lambda inst, val: setattr(label, "height", val[1]))
         label.bind(width=lambda inst, val: setattr(label, "text_size", (val, None)))
         self.add_widget(label)
 
         if not is_user:
-            copy_btn = Button(text="Copy Code", size_hint_y=None, height=dp(36))
+            row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+            copy_btn = Button(text="Copy Code")
             copy_btn.bind(on_release=lambda inst: Clipboard.copy(text))
-            self.add_widget(copy_btn)
+            row.add_widget(copy_btn)
+
+            pdf_btn = Button(text="Save as PDF")
+            pdf_btn.bind(on_release=lambda inst: self.save_pdf(text))
+            row.add_widget(pdf_btn)
+            self.add_widget(row)
+
+    def save_pdf(self, text):
+        try:
+            path = create_pdf_from_text(text)
+            popup = Popup(title="Saved",
+                           content=Label(text=f"PDF saved:\n{path}"),
+                           size_hint=(0.85, 0.3))
+            popup.open()
+        except Exception as e:
+            popup = Popup(title="Error",
+                           content=Label(text=str(e)),
+                           size_hint=(0.85, 0.3))
+            popup.open()
 
 
 class ChatScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.messages = load_history()
+
         root = BoxLayout(orientation="vertical")
 
         top_bar = BoxLayout(size_hint_y=None, height=dp(48), padding=dp(4), spacing=dp(4))
-        top_bar.add_widget(Label(text="Code Assistant"))
+        top_bar.add_widget(Label(text="Code Assistant", color=(1, 1, 1, 1)))
+        clear_btn = Button(text="Clear", size_hint_x=None, width=dp(80))
+        clear_btn.bind(on_release=self.clear_history)
+        top_bar.add_widget(clear_btn)
         settings_btn = Button(text="Settings", size_hint_x=None, width=dp(100))
         settings_btn.bind(on_release=lambda a: setattr(self.manager, "current", "settings"))
         top_bar.add_widget(settings_btn)
@@ -74,27 +151,91 @@ class ChatScreen(Screen):
         root.add_widget(self.scroll)
 
         input_bar = BoxLayout(size_hint_y=None, height=dp(56), padding=dp(4), spacing=dp(4))
-        self.input = TextInput(hint_text="App/website/game ka code maango...", multiline=False)
+        self.input = TextInput(
+            hint_text="App/website/game ka code maango...",
+            multiline=False,
+            foreground_color=(1, 1, 1, 1),      # FIX: text ab dikhega
+            background_color=(0.15, 0.15, 0.15, 1),
+            hint_text_color=(0.6, 0.6, 0.6, 1),
+            cursor_color=(1, 1, 1, 1),
+        )
         self.input.bind(on_text_validate=self.send_message)
+        upload_btn = Button(text="📎", size_hint_x=None, width=dp(50))
+        upload_btn.bind(on_release=self.open_file_chooser)
         send_btn = Button(text="Send", size_hint_x=None, width=dp(80))
         send_btn.bind(on_release=self.send_message)
+        input_bar.add_widget(upload_btn)
         input_bar.add_widget(self.input)
         input_bar.add_widget(send_btn)
         root.add_widget(input_bar)
 
         self.add_widget(root)
 
-    def add_bubble(self, text, is_user=False):
+        # restore old history on screen
+        for m in self.messages:
+            self.render_bubble(m["text"], m["is_user"])
+
+    def on_pre_enter(self, *a):
+        if not self.chat_box.children:
+            for m in self.messages:
+                self.render_bubble(m["text"], m["is_user"])
+
+    def render_bubble(self, text, is_user):
         bubble = ChatBubble(text=text, is_user=is_user, width=self.chat_box.width)
         self.chat_box.add_widget(bubble)
         self.scroll.scroll_y = 0
+
+    def add_bubble(self, text, is_user=False, persist=True):
+        self.render_bubble(text, is_user)
+        if persist:
+            self.messages.append({"text": text, "is_user": is_user})
+            save_history(self.messages)
+
+    def clear_history(self, *a):
+        self.messages = []
+        save_history(self.messages)
+        self.chat_box.clear_widgets()
+
+    # ---------- File upload ----------
+
+    def open_file_chooser(self, *a):
+        chooser = FileChooserListView(path="/storage/emulated/0/", filters=["*.pdf", "*.txt"])
+        popup = Popup(title="File chuno", content=chooser, size_hint=(0.9, 0.9))
+
+        def on_selection(instance, selection):
+            if selection:
+                popup.dismiss()
+                self.handle_uploaded_file(selection[0])
+
+        chooser.bind(selection=on_selection)
+        popup.open()
+
+    def handle_uploaded_file(self, filepath):
+        self.add_bubble(f"[File uploaded: {os.path.basename(filepath)}]", is_user=True)
+        if filepath.lower().endswith(".pdf"):
+            text = read_pdf_text(filepath)
+        else:
+            try:
+                with open(filepath, "r", errors="replace") as f:
+                    text = f.read()
+            except Exception as e:
+                text = f"(File read error: {e})"
+
+        settings = load_settings()
+        if not settings.get("api_key"):
+            self.add_bubble("⚠ Pehle Settings me API key daalo.", is_user=False)
+            return
+        prompt = f"Is file ke content ko analyze/summarize karo:\n\n{text[:6000]}"
+        self.call_ai(prompt, settings)
+
+    # ---------- Chat send ----------
 
     def send_message(self, *a):
         text = self.input.text.strip()
         if not text:
             return
         self.input.text = ""
-        self.add_bubble(f"You: {text}", is_user=True)
+        self.add_bubble(text, is_user=True)
         settings = load_settings()
         if not settings.get("api_key"):
             self.add_bubble("⚠ Pehle Settings me API key daalo.", is_user=False)
@@ -110,7 +251,9 @@ class ChatScreen(Screen):
             "Tum ek coding assistant ho. User jis app/website/game ka code maange, "
             "uska pura, clean, copy-paste-ready code do. Agar user format bataye "
             "(HTML, Python, Kivy, JS, etc.) to usi format me do. Agar user 'update' "
-            "ya 'fix' bole to sirf modified code do, saath me chhota explanation."
+            "ya 'fix' bole to sirf modified code do, saath me chhota explanation. "
+            "Agar user 'PDF format' maange, to inhe bolo ki 'Save as PDF' button "
+            "dabakar wo apne code ko turant real PDF file me convert kar sakte hain."
         )
 
         if provider == "Groq":
@@ -134,7 +277,7 @@ class ChatScreen(Screen):
                               "parts": [{"text": system_prompt + "\n\n" + prompt}]}]
             })
 
-        self.add_bubble("...soch raha hu...", is_user=False)
+        self.add_bubble("...soch raha hu...", is_user=False, persist=False)
 
         UrlRequest(
             url, req_body=body, req_headers=headers,
@@ -145,6 +288,9 @@ class ChatScreen(Screen):
 
     @mainthread
     def on_ai_success(self, result, provider):
+        # remove the "...soch raha hu..." placeholder bubble
+        if self.chat_box.children:
+            self.chat_box.remove_widget(self.chat_box.children[0])
         try:
             if provider == "Groq":
                 text = result["choices"][0]["message"]["content"]
@@ -156,6 +302,8 @@ class ChatScreen(Screen):
 
     @mainthread
     def on_ai_error(self, error):
+        if self.chat_box.children:
+            self.chat_box.remove_widget(self.chat_box.children[0])
         self.add_bubble(f"⚠ Error: {error}", is_user=False)
 
 
@@ -164,17 +312,19 @@ class SettingsScreen(Screen):
         super().__init__(**kwargs)
         layout = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
 
-        layout.add_widget(Label(text="Provider chuno:", size_hint_y=None, height=dp(30)))
+        layout.add_widget(Label(text="Provider chuno:", size_hint_y=None, height=dp(30), color=(1,1,1,1)))
         self.provider_spinner = Spinner(text="Groq", values=("Groq", "Gemini"),
                                          size_hint_y=None, height=dp(44))
         layout.add_widget(self.provider_spinner)
 
-        layout.add_widget(Label(text="API Key:", size_hint_y=None, height=dp(30)))
-        self.key_input = TextInput(multiline=False, password=True, size_hint_y=None, height=dp(44))
+        layout.add_widget(Label(text="API Key:", size_hint_y=None, height=dp(30), color=(1,1,1,1)))
+        self.key_input = TextInput(multiline=False, password=True, size_hint_y=None, height=dp(44),
+                                    foreground_color=(1,1,1,1))
         layout.add_widget(self.key_input)
 
-        layout.add_widget(Label(text="Model naam (optional):", size_hint_y=None, height=dp(30)))
-        self.model_input = TextInput(multiline=False, size_hint_y=None, height=dp(44))
+        layout.add_widget(Label(text="Model naam (optional):", size_hint_y=None, height=dp(30), color=(1,1,1,1)))
+        self.model_input = TextInput(multiline=False, size_hint_y=None, height=dp(44),
+                                      foreground_color=(1,1,1,1))
         layout.add_widget(self.model_input)
 
         save_btn = Button(text="Save", size_hint_y=None, height=dp(48))
@@ -185,7 +335,7 @@ class SettingsScreen(Screen):
         back_btn.bind(on_release=lambda a: setattr(self.manager, "current", "chat"))
         layout.add_widget(back_btn)
 
-        self.status = Label(text="", size_hint_y=None, height=dp(30))
+        self.status = Label(text="", size_hint_y=None, height=dp(30), color=(1,1,1,1))
         layout.add_widget(self.status)
         self.add_widget(layout)
 
