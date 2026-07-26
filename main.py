@@ -1,6 +1,8 @@
 import json
 import os
+import base64
 from kivy.app import App
+from kivy.core.window import Window
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.textinput import TextInput
@@ -10,10 +12,14 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.popup import Popup
+from kivy.uix.image import Image as KivyImage
 from kivy.core.clipboard import Clipboard
 from kivy.network.urlrequest import UrlRequest
 from kivy.clock import mainthread
 from kivy.metrics import dp
+
+# FIX: keyboard khulne par screen black/blank hone ka bug
+Window.softinput_mode = "below_target"
 
 CONFIG_FILE = "settings.json"
 HISTORY_FILE = "history.json"
@@ -94,6 +100,11 @@ def is_pdf_command(text):
     return any(word in lowered for word in PDF_COMMAND_WORDS)
 
 
+def image_to_base64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
 # ---------- UI ----------
 
 class ChatBubble(BoxLayout):
@@ -138,15 +149,16 @@ class ChatScreen(Screen):
         super().__init__(**kwargs)
         self.messages = load_history()
         self.last_ai_text = ""
+        self.pending_image_path = None
 
         root = BoxLayout(orientation="vertical")
 
         top_bar = BoxLayout(size_hint_y=None, height=dp(48), padding=dp(4), spacing=dp(4))
         top_bar.add_widget(Label(text="Code Assistant", color=(1, 1, 1, 1)))
-        clear_btn = Button(text="Clear", size_hint_x=None, width=dp(80))
+        clear_btn = Button(text="Clear", size_hint_x=None, width=dp(70))
         clear_btn.bind(on_release=self.clear_history)
         top_bar.add_widget(clear_btn)
-        settings_btn = Button(text="Settings", size_hint_x=None, width=dp(100))
+        settings_btn = Button(text="Settings", size_hint_x=None, width=dp(90))
         settings_btn.bind(on_release=lambda a: setattr(self.manager, "current", "settings"))
         top_bar.add_widget(settings_btn)
         root.add_widget(top_bar)
@@ -158,6 +170,24 @@ class ChatScreen(Screen):
         self.scroll.add_widget(self.chat_box)
         root.add_widget(self.scroll)
 
+        # Attachment preview strip (image chuni ho to yaha dikhega)
+        self.attach_label = Label(text="", size_hint_y=None, height=0, color=(0.7, 0.9, 1, 1))
+        root.add_widget(self.attach_label)
+
+        # Row 1: attachment buttons
+        attach_bar = BoxLayout(size_hint_y=None, height=dp(48), padding=dp(4), spacing=dp(4))
+        file_btn = Button(text="File")
+        file_btn.bind(on_release=self.open_file_chooser)
+        gallery_btn = Button(text="Gallery")
+        gallery_btn.bind(on_release=self.open_gallery)
+        camera_btn = Button(text="Camera")
+        camera_btn.bind(on_release=self.open_camera)
+        attach_bar.add_widget(file_btn)
+        attach_bar.add_widget(gallery_btn)
+        attach_bar.add_widget(camera_btn)
+        root.add_widget(attach_bar)
+
+        # Row 2: text input + send
         input_bar = BoxLayout(size_hint_y=None, height=dp(56), padding=dp(4), spacing=dp(4))
         self.input = TextInput(
             hint_text="App/website/game ka code maango...",
@@ -168,11 +198,8 @@ class ChatScreen(Screen):
             cursor_color=(1, 1, 1, 1),
         )
         self.input.bind(on_text_validate=self.send_message)
-        upload_btn = Button(text="Upload", size_hint_x=None, width=dp(80))
-        upload_btn.bind(on_release=self.open_file_chooser)
         send_btn = Button(text="Send", size_hint_x=None, width=dp(80))
         send_btn.bind(on_release=self.send_message)
-        input_bar.add_widget(upload_btn)
         input_bar.add_widget(self.input)
         input_bar.add_widget(send_btn)
         root.add_widget(input_bar)
@@ -203,7 +230,7 @@ class ChatScreen(Screen):
         save_history(self.messages)
         self.chat_box.clear_widgets()
 
-    # ---------- File upload ----------
+    # ---------- Attachments: File / Gallery / Camera ----------
 
     def open_file_chooser(self, *a):
         chooser = FileChooserListView(path="/storage/emulated/0/", filters=["*.pdf", "*.txt"])
@@ -216,6 +243,39 @@ class ChatScreen(Screen):
 
         chooser.bind(selection=on_selection)
         popup.open()
+
+    def open_gallery(self, *a):
+        try:
+            from plyer import filechooser
+            filechooser.open_file(
+                on_selection=self.on_gallery_selected,
+                filters=[["Images", "*.jpg", "*.jpeg", "*.png"]],
+            )
+        except Exception as e:
+            self.add_bubble(f"⚠ Gallery open nahi hui: {e}", is_user=False)
+
+    def on_gallery_selected(self, selection):
+        if selection:
+            self.attach_image(selection[0])
+
+    def open_camera(self, *a):
+        try:
+            from plyer import camera
+            path = get_path("camera_capture.jpg")
+            camera.take_picture(filename=path, on_complete=self.on_camera_captured)
+        except Exception as e:
+            self.add_bubble(f"⚠ Camera open nahi hui: {e}", is_user=False)
+
+    def on_camera_captured(self, filepath):
+        if filepath and os.path.exists(filepath):
+            self.attach_image(filepath)
+
+    def attach_image(self, path):
+        self.pending_image_path = path
+        self.attach_label.text = f"📷 Attached: {os.path.basename(path)} (Send dabao)"
+        self.attach_label.height = dp(28)
+
+    # ---------- File upload (pdf/txt) ----------
 
     def handle_uploaded_file(self, filepath):
         self.add_bubble(f"[File uploaded: {os.path.basename(filepath)}]", is_user=True)
@@ -239,13 +299,33 @@ class ChatScreen(Screen):
 
     def send_message(self, *a):
         text = self.input.text.strip()
-        if not text:
+        image_path = self.pending_image_path
+        self.pending_image_path = None
+        self.attach_label.text = ""
+        self.attach_label.height = 0
+
+        if not text and not image_path:
             return
+
+        settings = load_settings()
+
+        if image_path:
+            self.add_bubble((text or "[Image bheji]") + " 📷", is_user=True)
+            self.input.text = ""
+            if not settings.get("api_key"):
+                self.add_bubble("⚠ Pehle Settings me API key daalo.", is_user=False)
+                return
+            if settings.get("provider") != "Gemini":
+                self.add_bubble("⚠ Image samajhne ke liye Settings me provider 'Gemini' chuno "
+                                 "(Groq images support nahi karta).", is_user=False)
+                return
+            self.call_ai_with_image(text or "Is image me kya hai, describe/analyze karo.",
+                                     image_path, settings)
+            return
+
         self.input.text = ""
         self.add_bubble(text, is_user=True)
 
-        # NEW: agar user "pdf banao/creat karo" jaisa command de,
-        # to AI ko call na karke seedha last AI response ka real PDF bana do
         if is_pdf_command(text):
             if self.last_ai_text:
                 try:
@@ -258,7 +338,6 @@ class ChatScreen(Screen):
                                  is_user=False)
             return
 
-        settings = load_settings()
         if not settings.get("api_key"):
             self.add_bubble("⚠ Pehle Settings me API key daalo.", is_user=False)
             return
@@ -302,6 +381,33 @@ class ChatScreen(Screen):
         UrlRequest(
             url, req_body=body, req_headers=headers,
             on_success=lambda req, result: self.on_ai_success(result, provider),
+            on_failure=lambda req, result: self.on_ai_error(result),
+            on_error=lambda req, error: self.on_ai_error(str(error)),
+        )
+
+    def call_ai_with_image(self, prompt, image_path, settings):
+        api_key = settings.get("api_key", "")
+        model = settings.get("model") or "gemini-2.0-flash"
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={api_key}")
+        headers = {"Content-Type": "application/json"}
+        img_b64 = image_to_base64(image_path)
+        mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+        body = json.dumps({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime, "data": img_b64}},
+                ],
+            }]
+        })
+
+        self.add_bubble("...image dekh raha hu...", is_user=False, persist=False)
+
+        UrlRequest(
+            url, req_body=body, req_headers=headers,
+            on_success=lambda req, result: self.on_ai_success(result, "Gemini"),
             on_failure=lambda req, result: self.on_ai_error(result),
             on_error=lambda req, error: self.on_ai_error(str(error)),
         )
